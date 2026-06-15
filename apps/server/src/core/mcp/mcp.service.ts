@@ -14,12 +14,16 @@ import { SpaceService } from '../space/services/space.service';
 import { CommentService } from '../comment/comment.service';
 import { SearchService } from '../search/search.service';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
+import { TemplateRepo } from '@docmost/db/repos/template/template.repo';
+import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { User, Workspace } from '@docmost/db/types/entity.types';
 import { JwtApiKeyPayload, JwtPayload, JwtType } from '../auth/dto/jwt-payload';
 import { isUserDisabled } from '../../common/helpers';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { CreateCommentDto } from '../comment/dto/create-comment.dto';
 import { UpdateSpaceDto } from '../space/dto/update-space.dto';
+import { markdownToHtml } from '@docmost/editor-ext';
+import { htmlToJson } from 'src/collaboration/collaboration.util';
 
 export interface McpTool {
   name: string;
@@ -47,6 +51,8 @@ export class McpService {
     private readonly commentService: CommentService,
     private readonly searchService: SearchService,
     private readonly attachmentRepo: AttachmentRepo,
+    private readonly templateRepo: TemplateRepo,
+    private readonly spaceMemberRepo: SpaceMemberRepo,
   ) {}
 
   async authenticateRequest(
@@ -330,6 +336,68 @@ export class McpService {
           properties: {},
         },
       },
+      {
+        name: 'list_templates',
+        description: 'List templates accessible in the workspace',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            spaceId: { type: 'string', description: 'Optional space UUID to filter templates' },
+            query: { type: 'string', description: 'Optional search query to filter by title or description' },
+            limit: { type: 'number', description: 'Max results (default 50)' },
+          },
+        },
+      },
+      {
+        name: 'get_template',
+        description: 'Get a template by ID including its content',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            templateId: { type: 'string', description: 'Template UUID' },
+          },
+          required: ['templateId'],
+        },
+      },
+      {
+        name: 'create_template',
+        description: 'Create a new template',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Template title' },
+            description: { type: 'string', description: 'Template description' },
+            content: { type: 'string', description: 'Template content in markdown' },
+            spaceId: { type: 'string', description: 'Optional space UUID to scope the template to a space' },
+          },
+          required: ['title'],
+        },
+      },
+      {
+        name: 'create_page_from_template',
+        description: 'Create a new page pre-populated with a template\'s content',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            templateId: { type: 'string', description: 'Template UUID to use as source' },
+            spaceId: { type: 'string', description: 'Destination space UUID' },
+            title: { type: 'string', description: 'Page title (defaults to template title)' },
+            parentPageId: { type: 'string', description: 'Optional parent page UUID' },
+          },
+          required: ['templateId', 'spaceId'],
+        },
+      },
+      {
+        name: 'delete_template',
+        description: 'Delete a template',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            templateId: { type: 'string', description: 'Template UUID' },
+          },
+          required: ['templateId'],
+        },
+      },
     ];
   }
 
@@ -378,6 +446,11 @@ export class McpService {
       case 'search_attachments':  return this.searchAttachments(args);
       case 'list_workspace_members': return this.listWorkspaceMembers(args, workspace);
       case 'get_current_user':    return this.getCurrentUser(user);
+      case 'list_templates':      return this.listTemplates(args, user, workspace);
+      case 'get_template':        return this.getTemplate(args, workspace);
+      case 'create_template':     return this.createTemplate(args, user, workspace);
+      case 'create_page_from_template': return this.createPageFromTemplate(args, user, workspace);
+      case 'delete_template':     return this.deleteTemplate(args, workspace);
       default:
         throw new NotFoundException(`Unknown tool: ${name}`);
     }
@@ -559,5 +632,76 @@ export class McpService {
 
   private getCurrentUser(user: User) {
     return JSON.stringify({ id: user.id, name: user.name, email: user.email, role: user.role, workspaceId: user.workspaceId }, null, 2);
+  }
+
+  private async listTemplates(args: Record<string, unknown>, user: User, workspace: Workspace) {
+    const accessibleSpaceIds = await this.spaceMemberRepo.getUserSpaceIds(user.id);
+    const pagination = {
+      limit: (args.limit as number) ?? 50,
+      query: args.query as string | undefined,
+    } as PaginationOptions;
+    const result = await this.templateRepo.findTemplates(
+      workspace.id,
+      accessibleSpaceIds,
+      pagination,
+      { spaceId: args.spaceId as string | undefined },
+    );
+    return JSON.stringify(result.items, null, 2);
+  }
+
+  private async getTemplate(args: Record<string, unknown>, workspace: Workspace) {
+    const template = await this.templateRepo.findById(
+      args.templateId as string,
+      workspace.id,
+      { includeContent: true },
+    );
+    if (!template) throw new NotFoundException('Template not found');
+    return JSON.stringify(template, null, 2);
+  }
+
+  private async createTemplate(args: Record<string, unknown>, user: User, workspace: Workspace) {
+    let content: object | undefined;
+    if (args.content) {
+      const html = await markdownToHtml(args.content as string);
+      content = htmlToJson(html as string);
+    }
+    const result = await this.templateRepo.insertTemplate({
+      title: args.title as string,
+      description: (args.description as string) ?? null,
+      content: (content ?? null) as any,
+      spaceId: (args.spaceId as string) ?? null,
+      workspaceId: workspace.id,
+      creatorId: user.id,
+      lastUpdatedById: user.id,
+    });
+    return JSON.stringify({ id: result.id }, null, 2);
+  }
+
+  private async createPageFromTemplate(args: Record<string, unknown>, user: User, workspace: Workspace) {
+    const template = await this.templateRepo.findById(
+      args.templateId as string,
+      workspace.id,
+      { includeContent: true },
+    );
+    if (!template) throw new NotFoundException('Template not found');
+
+    const page = await this.pageService.create(user.id, workspace.id, {
+      spaceId: args.spaceId as string,
+      title: (args.title as string) ?? template.title ?? undefined,
+      content: (template.content as object) ?? undefined,
+      format: template.content ? 'json' : undefined,
+      parentPageId: args.parentPageId as string | undefined,
+    });
+    return JSON.stringify({ id: page.id, slugId: page.slugId, title: page.title }, null, 2);
+  }
+
+  private async deleteTemplate(args: Record<string, unknown>, workspace: Workspace) {
+    const template = await this.templateRepo.findById(
+      args.templateId as string,
+      workspace.id,
+    );
+    if (!template) throw new NotFoundException('Template not found');
+    await this.templateRepo.deleteTemplate(args.templateId as string, workspace.id);
+    return JSON.stringify({ success: true, templateId: args.templateId }, null, 2);
   }
 }
