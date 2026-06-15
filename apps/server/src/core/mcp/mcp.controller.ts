@@ -8,6 +8,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { McpService } from './mcp.service';
+import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -31,6 +32,7 @@ export class McpController {
 
   constructor(private readonly mcpService: McpService) {}
 
+  @SkipTransform()
   @HttpCode(HttpStatus.OK)
   @Post()
   async handleRequest(
